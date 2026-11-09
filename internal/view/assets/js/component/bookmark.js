@@ -26,6 +26,9 @@ var template = `
 			<a title="Edit bookmark" @click="editBookmark">
 				<i class="fas fa-fw fa-pencil-alt"></i>
 			</a>
+			<a v-if="historyVisible" title="History URLs" @click="showHistory">
+				<i class="fas fa-fw fa-history"></i>
+			</a>
 			<a title="Delete bookmark" @click="deleteBookmark">
 				<i class="fas fa-fw fa-trash-alt"></i>
 			</a>
@@ -60,6 +63,7 @@ export default {
 		HideExcerpt: Boolean,
 		selected: Boolean,
 		menuVisible: Boolean,
+		historyVisible: Boolean,
 		tags: {
 			type: Array,
 			default() {
@@ -117,6 +121,9 @@ export default {
 		},
 		editBookmark() {
 			this.$emit("edit", this.eventItem);
+		},
+		showHistory() {
+			this.$emit("history", this.eventItem);
 		},
 		deleteBookmark() {
 			this.$emit("delete", this.eventItem);

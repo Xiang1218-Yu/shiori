@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	nurl "net/url"
+	"strings"
 
 	"github.com/go-shiori/shiori/internal/core"
 	"github.com/go-shiori/shiori/internal/database"
@@ -229,7 +231,8 @@ func (d *BookmarksDomain) CreateBookmark(ctx context.Context, bookmark model.Boo
 	savedBookmarks, err := d.deps.Database().SaveBookmarks(ctx, true, dto)
 	if err != nil {
 		// Map database errors to domain errors
-		if errors.Is(err, database.ErrBookmarkURLAlreadyExists) {
+		if errors.Is(err, database.ErrBookmarkURLAlreadyExists) ||
+			errors.Is(err, model.ErrBookmarkAliasConflict) {
 			return nil, model.ErrBookmarkAlreadyExists
 		}
 		return nil, fmt.Errorf("failed to save bookmark: %w", err)
@@ -264,7 +267,8 @@ func (d *BookmarksDomain) UpdateBookmark(ctx context.Context, bookmark model.Boo
 	// Update bookmark in database
 	savedBookmarks, err := d.deps.Database().SaveBookmarks(ctx, false, dto)
 	if err != nil {
-		if errors.Is(err, database.ErrBookmarkURLAlreadyExists) {
+		if errors.Is(err, database.ErrBookmarkURLAlreadyExists) ||
+			errors.Is(err, model.ErrBookmarkAliasConflict) {
 			return nil, model.ErrBookmarkAlreadyExists
 		}
 		return nil, fmt.Errorf("failed to update bookmark: %w", err)
@@ -314,4 +318,90 @@ func NewBookmarksDomain(deps model.Dependencies) *BookmarksDomain {
 	return &BookmarksDomain{
 		deps: deps,
 	}
+}
+
+// HistoryURLsEnabled reports whether history URL aliases are active.
+func (d *BookmarksDomain) HistoryURLsEnabled() bool {
+	return d.deps.Database().HistoryURLsEnabled()
+}
+
+// normalizeAliasURL trims, validates and normalizes a history URL the same
+// way bookmark URLs are normalized when bookmarks are created.
+func (d *BookmarksDomain) normalizeAliasURL(alias string) (string, error) {
+	alias = strings.TrimSpace(alias)
+
+	parsed, err := nurl.Parse(alias)
+	if err != nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return "", fmt.Errorf("history URL is not a valid absolute URL: %q", alias)
+	}
+
+	cleanURL, err := core.RemoveUTMParams(alias)
+	if err != nil {
+		return "", fmt.Errorf("failed to normalize history URL: %w", err)
+	}
+	return cleanURL, nil
+}
+
+// ResolveBookmarkByURL maps a current or history URL to the stable bookmark
+// identity behind it. Returns model.ErrBookmarkNotFound when no bookmark
+// owns the address.
+func (d *BookmarksDomain) ResolveBookmarkByURL(ctx context.Context, url string) (*model.BookmarkDTO, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return nil, model.ErrBookmarkNotFound
+	}
+
+	id, found, err := d.deps.Database().ResolveBookmarkIDByURL(ctx, url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve bookmark URL: %w", err)
+	}
+	if !found {
+		return nil, model.ErrBookmarkNotFound
+	}
+
+	return d.GetBookmark(ctx, model.DBID(id))
+}
+
+// AddBookmarkAlias records a history URL for a bookmark. The association is
+// idempotent and conflicts with addresses owned by another bookmark are
+// rejected with model.ErrBookmarkAliasConflict.
+func (d *BookmarksDomain) AddBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error {
+	if !d.HistoryURLsEnabled() {
+		return model.ErrBookmarkHistoryDisabled
+	}
+
+	cleanURL, err := d.normalizeAliasURL(alias)
+	if err != nil {
+		return err
+	}
+
+	if err := d.deps.Database().AddBookmarkAlias(ctx, bookmarkID, cleanURL); err != nil {
+		if errors.Is(err, model.ErrBookmarkAliasConflict) ||
+			errors.Is(err, model.ErrBookmarkNotFound) ||
+			errors.Is(err, model.ErrBookmarkHistoryDisabled) {
+			return err
+		}
+		return fmt.Errorf("failed to add bookmark alias: %w", err)
+	}
+	return nil
+}
+
+// DeleteBookmarkAlias removes a history URL from a bookmark.
+func (d *BookmarksDomain) DeleteBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error {
+	if !d.HistoryURLsEnabled() {
+		return model.ErrBookmarkHistoryDisabled
+	}
+
+	cleanURL, err := d.normalizeAliasURL(alias)
+	if err != nil {
+		return err
+	}
+
+	if err := d.deps.Database().DeleteBookmarkAlias(ctx, bookmarkID, cleanURL); err != nil {
+		if errors.Is(err, model.ErrBookmarkHistoryDisabled) {
+			return err
+		}
+		return fmt.Errorf("failed to delete bookmark alias: %w", err)
+	}
+	return nil
 }

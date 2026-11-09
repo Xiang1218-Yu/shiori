@@ -64,6 +64,13 @@ type BookmarksDomain interface {
 	CreateBookmark(ctx context.Context, bookmark Bookmark) (*BookmarkDTO, error)
 	UpdateBookmark(ctx context.Context, bookmark Bookmark) (*BookmarkDTO, error)
 	DeleteBookmarks(ctx context.Context, ids []int) error
+
+	// History URL aliases. These only take effect when history URLs are
+	// enabled through configuration.
+	HistoryURLsEnabled() bool
+	ResolveBookmarkByURL(ctx context.Context, url string) (*BookmarkDTO, error)
+	AddBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error
+	DeleteBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error
 }
 
 type AuthDomain interface {

@@ -151,6 +151,7 @@ onMounted(() => {
           @download-ebook="downloadEbook"
           @view-content="goToContent"
           @open-original="goToOriginal"
+          @history-urls-changed="loadBookmark"
         />
 
         <!-- Archive Frame -->

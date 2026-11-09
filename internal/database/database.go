@@ -50,6 +50,11 @@ type dbbase struct {
 	flavor sqlbuilder.Flavor
 	reader *sqlx.DB
 	writer *sqlx.DB
+
+	// historyURLsEnabled gates the bookmark_alias based lookups and writes.
+	// It defaults to false so plain URL behavior is preserved unless the
+	// BOOKMARK_HISTORY_URLS_ENABLED configuration option is turned on.
+	historyURLsEnabled bool
 }
 
 func (db *dbbase) Flavor() sqlbuilder.Flavor {

@@ -110,6 +110,13 @@ type StorageConfig struct {
 	DataDir string `env:"DIR"` // Using DIR to be backwards compatible with the old config
 }
 
+type BookmarkConfig struct {
+	// HistoryURLsEnabled keeps track of the previous URLs of a bookmark so
+	// old URLs can be resolved to the same bookmark. When disabled, all
+	// bookmark lookups keep behaving exactly as plain URL lookups.
+	HistoryURLsEnabled bool `env:"BOOKMARK_HISTORY_URLS_ENABLED,default=False"`
+}
+
 type Config struct {
 	Hostname    string `env:"HOSTNAME,required"`
 	Development bool   `env:"DEVELOPMENT,default=False"`
@@ -117,6 +124,7 @@ type Config struct {
 	Database    *DatabaseConfig
 	Storage     *StorageConfig
 	Http        *HttpConfig
+	Bookmark    *BookmarkConfig
 }
 
 // SetDefaults sets the default values for the configuration
@@ -167,6 +175,7 @@ func (c *Config) DebugConfiguration(logger *logrus.Logger) {
 	logger.Debugf(" SHIORI_SSO_PROXY_AUTH_ENABLED: %t", c.Http.SSOProxyAuth)
 	logger.Debugf(" SHIORI_SSO_PROXY_AUTH_HEADER_NAME: %s", c.Http.SSOProxyAuthHeaderName)
 	logger.Debugf(" SHIORI_SSO_PROXY_AUTH_TRUSTED: %v", c.Http.SSOProxyAuthTrusted)
+	logger.Debugf(" SHIORI_BOOKMARK_HISTORY_URLS_ENABLED: %t", c.Bookmark.HistoryURLsEnabled)
 }
 
 func (c *Config) IsValid() error {

@@ -233,6 +233,23 @@ func (s *HttpServer) Setup(cfg *config.Config, deps *dependencies.Dependencies) 
 		api_v1.HandleRemoveTagFromBookmark,
 		globalMiddleware...,
 	))
+	// Bookmark history URL (alias) endpoints
+	s.mux.HandleFunc("GET /api/v1/bookmarks/capabilities", ToHTTPHandler(deps,
+		api_v1.HandleBookmarkCapabilities,
+		globalMiddleware...,
+	))
+	s.mux.HandleFunc("GET /api/v1/bookmarks/resolve", ToHTTPHandler(deps,
+		api_v1.HandleResolveBookmark,
+		globalMiddleware...,
+	))
+	s.mux.HandleFunc("POST /api/v1/bookmarks/{id}/aliases", ToHTTPHandler(deps,
+		api_v1.HandleAddBookmarkAlias,
+		globalMiddleware...,
+	))
+	s.mux.HandleFunc("DELETE /api/v1/bookmarks/{id}/aliases", ToHTTPHandler(deps,
+		api_v1.HandleDeleteBookmarkAlias,
+		globalMiddleware...,
+	))
 
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s%d", cfg.Http.Address, cfg.Http.Port),

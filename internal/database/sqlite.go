@@ -64,6 +64,7 @@ var sqliteMigrations = []migration{
 	newFileMigration("0.3.0", "0.4.0", "sqlite/0002_denormalize_content"),
 	newFileMigration("0.4.0", "0.5.0", "sqlite/0003_uniq_id"),
 	newFileMigration("0.5.0", "0.6.0", "sqlite/0004_created_time"),
+	newFileMigration("0.6.0", "0.7.0", "sqlite/0005_bookmark_alias"),
 }
 
 // SQLiteDatabase is implementation of Database interface
@@ -270,6 +271,11 @@ func (db *SQLiteDatabase) SaveBookmarks(ctx context.Context, create bool, bookma
 			return fmt.Errorf("failed to execute delete statement: %w", err)
 		}
 
+		stmtGetBookURL, err := tx.PreparexContext(ctx, `SELECT url FROM bookmark WHERE id = ?`)
+		if err != nil {
+			return fmt.Errorf("failed to prepare get bookmark URL statement: %w", err)
+		}
+
 		// Prepare modified time
 		modifiedTime := time.Now().UTC().Format(model.DatabaseDateFormat)
 
@@ -296,11 +302,34 @@ func (db *SQLiteDatabase) SaveBookmarks(ctx context.Context, create bool, bookma
 			var err error
 			if create {
 				book.CreatedAt = modifiedTime
+				if db.historyURLsEnabled {
+					// Reject addresses that must keep resolving to an existing
+					// bookmark through its history URLs.
+					if err := db.rejectURLUsedAsAlias(ctx, tx, book.URL); err != nil {
+						return err
+					}
+				}
 				err = stmtInsertBook.QueryRowContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author, book.Public, book.ModifiedAt, hasContent, book.CreatedAt).Scan(&book.ID)
 			} else {
+				var oldURL string
+				if db.historyURLsEnabled {
+					// Fetch the current URL before updating so the previous
+					// address can be kept as history.
+					if err := stmtGetBookURL.GetContext(ctx, &oldURL, book.ID); err != nil {
+						return fmt.Errorf("failed to get current bookmark URL: %w", err)
+					}
+				}
 				_, err = stmtUpdateBook.ExecContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author, book.Public, book.ModifiedAt, hasContent, book.ID)
+
+				// Record history after the URL actually changed, still inside
+				// the transaction so a conflict rolls the whole update back.
+				if err == nil && db.historyURLsEnabled {
+					if err := db.recordBookmarkURLHistory(ctx, tx, book.ID, oldURL, book.URL); err != nil {
+						return err
+					}
+				}
 			}
 			if err != nil {
 				// Map unique constraint violations to database errors
@@ -421,7 +450,7 @@ func (db *SQLiteDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBook
 		query += ` AND (b.url LIKE '%' || ? || '%' OR b.excerpt LIKE '%' || ? || '%' OR b.id IN (
 			SELECT docid id
 			FROM bookmark_content
-			WHERE title MATCH ? OR content MATCH ?))`
+			WHERE title MATCH ? OR content MATCH ?)`
 
 		args = append(args, opts.Keyword, opts.Keyword)
 
@@ -434,6 +463,17 @@ func (db *SQLiteDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBook
 		ftsKeyword = strings.ReplaceAll(ftsKeyword, "\"", "\"\"")
 
 		args = append(args, "\""+ftsKeyword+"\"", "\""+ftsKeyword+"\"")
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR b.id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE '%' || ? || '%')`
+			args = append(args, opts.Keyword)
+		}
+
+		query += `)`
 	}
 
 	// Add where clause for tags.
@@ -559,6 +599,11 @@ func (db *SQLiteDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBook
 		bookmarks[i].Tags = tags
 	}
 
+	// Populate history URLs when the feature is enabled.
+	if err := db.enrichBookmarksWithAliases(ctx, bookmarks); err != nil {
+		return nil, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+
 	return bookmarks, nil
 }
 
@@ -603,7 +648,7 @@ func (db *SQLiteDatabase) GetBookmarksCount(ctx context.Context, opts model.DBGe
 		query += ` AND (b.url LIKE '%' || ? || '%' OR b.excerpt LIKE '%' || ? || '%' OR b.id IN (
 			SELECT docid id
 			FROM bookmark_content
-			WHERE title MATCH ? OR content MATCH ?))`
+			WHERE title MATCH ? OR content MATCH ?)`
 
 		args = append(args, opts.Keyword, opts.Keyword)
 
@@ -616,6 +661,17 @@ func (db *SQLiteDatabase) GetBookmarksCount(ctx context.Context, opts model.DBGe
 		ftsKeyword = strings.ReplaceAll(ftsKeyword, "\"", "\"\"")
 
 		args = append(args, "\""+ftsKeyword+"\"", "\""+ftsKeyword+"\"")
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR b.id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE '%' || ? || '%')`
+			args = append(args, opts.Keyword)
+		}
+
+		query += `)`
 	}
 
 	// Add where clause for tags.
@@ -696,6 +752,11 @@ func (db *SQLiteDatabase) DeleteBookmarks(ctx context.Context, ids ...int) error
 
 		// Delete bookmark(s)
 		if len(ids) == 0 {
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, nil); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
+			}
+
 			_, err := tx.ExecContext(ctx, delBookmarkContent)
 			if err != nil {
 				return fmt.Errorf("failed to prepare delete statement: %w", err)
@@ -730,6 +791,11 @@ func (db *SQLiteDatabase) DeleteBookmarks(ctx context.Context, ids ...int) error
 				return fmt.Errorf("failed to delete bookmark content: %w", err)
 			}
 
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, ids); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
+			}
+
 			for _, id := range ids {
 				_, err = stmtDelBookmarkContent.ExecContext(ctx, id)
 				if err != nil {
@@ -759,6 +825,20 @@ func (db *SQLiteDatabase) DeleteBookmarks(ctx context.Context, ids ...int) error
 // GetBookmark fetches bookmark based on its ID or URL.
 // Returns the bookmark and boolean whether it's exist or not.
 func (db *SQLiteDatabase) GetBookmark(ctx context.Context, id int, url string) (model.BookmarkDTO, bool, error) {
+	// Resolve history URLs to the bookmark's stable identity when enabled.
+	// When disabled this keeps the historical behavior of matching the
+	// bookmark's current URL only.
+	if id == 0 && url != "" && db.historyURLsEnabled {
+		resolvedID, found, err := db.ResolveBookmarkIDByURL(ctx, url)
+		if err != nil {
+			return model.BookmarkDTO{}, false, fmt.Errorf("failed to resolve bookmark URL: %w", err)
+		}
+		if found {
+			id = resolvedID
+			url = ""
+		}
+	}
+
 	// Create the main query builder for bookmark data
 	sb := sqlbuilder.NewSelectBuilder()
 	sb.Select(
@@ -812,6 +892,13 @@ func (db *SQLiteDatabase) GetBookmark(ctx context.Context, id int, url string) (
 
 		book.Tags = tags
 	}
+
+	// Populate history URLs when the feature is enabled.
+	enriched := []model.BookmarkDTO{book}
+	if err := db.enrichBookmarksWithAliases(ctx, enriched); err != nil {
+		return book, false, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+	book = enriched[0]
 
 	return book, true, nil
 }
@@ -1191,10 +1278,26 @@ func (db *SQLiteDatabase) SaveBookmark(ctx context.Context, bookmark model.Bookm
 	query = db.WriterDB().Rebind(query)
 
 	return db.withTx(ctx, func(tx *sqlx.Tx) error {
+		var oldURL string
+		if db.historyURLsEnabled {
+			err := tx.GetContext(ctx, &oldURL, `SELECT url FROM bookmark WHERE id = ?`, bookmark.ID)
+			if err != nil {
+				return fmt.Errorf("failed to get current bookmark URL: %w", err)
+			}
+		}
+
 		// Update bookmark
 		_, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to update bookmark: %w", err)
+		}
+
+		// Record history after the URL actually changed, still inside the
+		// transaction so a conflict rolls the whole update back.
+		if db.historyURLsEnabled {
+			if err := db.recordBookmarkURLHistory(ctx, tx, bookmark.ID, oldURL, bookmark.URL); err != nil {
+				return err
+			}
 		}
 
 		return nil

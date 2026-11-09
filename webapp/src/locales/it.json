@@ -29,6 +29,10 @@
   "bookmarks": {
     "title": "Segnalibri",
     "add_bookmark": "Aggiungi Segnalibro",
+    "history_urls": "URL storiche",
+    "history_urls_description": "Vecchi indirizzi che continuano a puntare a questo segnalibro",
+    "add_history_url": "Aggiungi URL storica",
+    "history_url_placeholder": "https://previous.example.com/page",
     "edit_bookmark": "Modifica Segnalibro",
     "delete_bookmark": "Elimina Segnalibro",
     "url": "URL",

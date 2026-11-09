@@ -70,6 +70,7 @@ var postgresMigrations = []migration{
 		return nil
 	}),
 	newFileMigration("0.3.0", "0.4.0", "postgres/0002_created_time"),
+	newFileMigration("0.4.0", "0.5.0", "postgres/0003_bookmark_alias"),
 }
 
 // PGDatabase is implementation of Database interface
@@ -184,6 +185,11 @@ func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks 
 			return errors.WithStack(err)
 		}
 
+		stmtGetBookURL, err := tx.Preparex(`SELECT url FROM bookmark WHERE id = $1`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
 		// Prepare modified time
 		modifiedTime := time.Now().UTC().Format(model.DatabaseDateFormat)
 
@@ -208,13 +214,36 @@ func (db *PGDatabase) SaveBookmarks(ctx context.Context, create bool, bookmarks 
 			var err error
 			if create {
 				book.CreatedAt = modifiedTime
+				if db.historyURLsEnabled {
+					// Reject addresses that must keep resolving to an existing
+					// bookmark through its history URLs.
+					if err := db.rejectURLUsedAsAlias(ctx, tx, book.URL); err != nil {
+						return err
+					}
+				}
 				err = stmtInsertBook.QueryRowContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
 					book.Public, book.Content, book.HTML, book.ModifiedAt, book.CreatedAt).Scan(&book.ID)
 			} else {
+				var oldURL string
+				if db.historyURLsEnabled {
+					// Fetch the current URL before updating so the previous
+					// address can be kept as history.
+					if err := stmtGetBookURL.GetContext(ctx, &oldURL, book.ID); err != nil {
+						return fmt.Errorf("failed to get current bookmark URL: %w", err)
+					}
+				}
 				_, err = stmtUpdateBook.ExecContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
 					book.Public, book.Content, book.HTML, book.ModifiedAt, book.ID)
+
+				// Record history after the URL actually changed, still inside
+				// the transaction so a conflict rolls the whole update back.
+				if err == nil && db.historyURLsEnabled {
+					if err := db.recordBookmarkURLHistory(ctx, tx, book.ID, oldURL, book.URL); err != nil {
+						return err
+					}
+				}
 			}
 			if err != nil {
 				if isPQUniqueViolation(err, "bookmark_url_UNIQUE") {
@@ -315,8 +344,17 @@ func (db *PGDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBookmark
 			url LIKE '%' || :kw || '%' OR
 			title LIKE '%' || :kw || '%' OR
 			excerpt LIKE '%' || :kw || '%' OR
-			content LIKE '%' || :kw || '%'
-		)`
+			content LIKE '%' || :kw || '%'`
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE '%' || :kw || '%')`
+		}
+
+		query += `)`
 
 		arg["kw"] = opts.Keyword
 	}
@@ -421,6 +459,11 @@ func (db *PGDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBookmark
 		bookmarks[i] = book
 	}
 
+	// Populate history URLs when the feature is enabled.
+	if err := db.enrichBookmarksWithAliases(ctx, bookmarks); err != nil {
+		return nil, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+
 	return bookmarks, nil
 }
 
@@ -443,8 +486,17 @@ func (db *PGDatabase) GetBookmarksCount(ctx context.Context, opts model.DBGetBoo
 			url LIKE '%' || :kw || '%' OR
 			title LIKE '%' || :kw || '%' OR
 			excerpt LIKE '%' || :kw || '%' OR
-			content LIKE '%' || :kw || '%'
-		)`
+			content LIKE '%' || :kw || '%'`
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE '%' || :kw || '%')`
+		}
+
+		query += `)`
 
 		arg["lurl"] = "%" + opts.Keyword + "%"
 		arg["kw"] = opts.Keyword
@@ -535,6 +587,11 @@ func (db *PGDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err erro
 
 		// Delete bookmark(s)
 		if len(ids) == 0 {
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, nil); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
+			}
+
 			_, err := tx.ExecContext(ctx, delBookmarkTag)
 			if err != nil {
 				return errors.WithStack(err)
@@ -555,6 +612,11 @@ func (db *PGDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err erro
 			stmtDelBookmarkTag, err := tx.Preparex(delBookmarkTag)
 			if err != nil {
 				return errors.WithStack(err)
+			}
+
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, ids); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
 			}
 
 			for _, id := range ids {
@@ -581,6 +643,20 @@ func (db *PGDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err erro
 // GetBookmark fetches bookmark based on its ID or URL.
 // Returns the bookmark and boolean whether it's exist or not.
 func (db *PGDatabase) GetBookmark(ctx context.Context, id int, url string) (model.BookmarkDTO, bool, error) {
+	// Resolve history URLs to the bookmark's stable identity when enabled.
+	// When disabled this keeps the historical behavior of matching the
+	// bookmark's current URL only.
+	if id == 0 && url != "" && db.historyURLsEnabled {
+		resolvedID, found, err := db.ResolveBookmarkIDByURL(ctx, url)
+		if err != nil {
+			return model.BookmarkDTO{}, false, fmt.Errorf("failed to resolve bookmark URL: %w", err)
+		}
+		if found {
+			id = resolvedID
+			url = ""
+		}
+	}
+
 	// Create the main query builder for bookmark data
 	sb := sqlbuilder.PostgreSQL.NewSelectBuilder()
 	sb.Select(
@@ -633,6 +709,13 @@ func (db *PGDatabase) GetBookmark(ctx context.Context, id int, url string) (mode
 
 		book.Tags = tags
 	}
+
+	// Populate history URLs when the feature is enabled.
+	enriched := []model.BookmarkDTO{book}
+	if err := db.enrichBookmarksWithAliases(ctx, enriched); err != nil {
+		return book, false, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+	book = enriched[0]
 
 	return book, true, nil
 }
@@ -1030,10 +1113,26 @@ func (db *PGDatabase) SaveBookmark(ctx context.Context, bookmark model.Bookmark)
 	query = db.WriterDB().Rebind(query)
 
 	return db.withTx(ctx, func(tx *sqlx.Tx) error {
+		var oldURL string
+		if db.historyURLsEnabled {
+			err := tx.GetContext(ctx, &oldURL, `SELECT url FROM bookmark WHERE id = $1`, bookmark.ID)
+			if err != nil {
+				return fmt.Errorf("failed to get current bookmark URL: %w", err)
+			}
+		}
+
 		// Update bookmark
 		_, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to update bookmark: %w", err)
+		}
+
+		// Record history after the URL actually changed, still inside the
+		// transaction so a conflict rolls the whole update back.
+		if db.historyURLsEnabled {
+			if err := db.recordBookmarkURLHistory(ctx, tx, bookmark.ID, oldURL, bookmark.URL); err != nil {
+				return err
+			}
 		}
 
 		return nil

@@ -18,6 +18,11 @@ type Bookmark struct {
 	Content    string `db:"content" json:"-"`
 	HTML       string `db:"html"    json:",omitempty"`
 	HasContent bool   `db:"has_content"`
+
+	// HistoryURLs holds the previous URLs that this bookmark was known under.
+	// It is not a column of the bookmark table, it is populated from the
+	// bookmark_alias table and is only used when history URLs are enabled.
+	HistoryURLs []string `db:"-" json:"HistoryURLs,omitempty"`
 }
 
 // BookmarkDTO is the data transfer object for bookmarks sent to/from clients

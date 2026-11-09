@@ -65,6 +65,13 @@
         {{ t('bookmarks.archived_version') }}
       </span>
     </div>
+
+    <BookmarkHistoryURLs
+      v-if="bookmark.id"
+      :bookmark-id="bookmark.id"
+      :history-urls="historyURLs"
+      @changed="$emit('historyUrlsChanged')"
+    />
   </div>
 </template>
 
@@ -79,6 +86,7 @@ import {
   ExternalLinkIcon,
 } from '@/components/icons';
 import Button from './ui/Button.vue';
+import BookmarkHistoryURLs from './BookmarkHistoryURLs.vue';
 
 interface Props {
   bookmark: ModelBookmarkDTO;
@@ -102,9 +110,18 @@ const emit = defineEmits<{
   viewArchive: [];
   viewContent: [];
   openOriginal: [];
+  historyUrlsChanged: [];
 }>();
 
 const { t } = useI18n();
+
+// History URLs are serialized as `HistoryURLs` by the Go API and are not part
+// of the generated client model yet, so read them defensively.
+const historyURLs = computed<string[]>(() => {
+  const value = (props.bookmark as unknown as Record<string, unknown>)
+    .HistoryURLs;
+  return Array.isArray(value) ? (value as string[]) : [];
+});
 
 const hasEbook = computed(() => {
   return props.bookmark.hasEbook || false;

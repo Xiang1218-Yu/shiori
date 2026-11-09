@@ -104,6 +104,29 @@ type DB interface {
 
 	// BookmarkExists checks if a bookmark with the given ID exists in the database
 	BookmarkExists(ctx context.Context, bookmarkID int) (bool, error)
+
+	// HistoryURLsEnabled reports whether history URL aliases are active.
+	HistoryURLsEnabled() bool
+
+	// SetHistoryURLsEnabled toggles history URL aliases at runtime.
+	SetHistoryURLsEnabled(enabled bool)
+
+	// ResolveBookmarkIDByURL maps a URL to the stable ID of a bookmark,
+	// checking first the bookmark's current URL and then its history URLs.
+	// When history URLs are disabled only current URLs are considered.
+	ResolveBookmarkIDByURL(ctx context.Context, url string) (int, bool, error)
+
+	// AddBookmarkAlias associates a history URL with a bookmark. Associating
+	// the same URL twice is a no-op, associating a URL already owned by
+	// another bookmark returns ErrBookmarkAliasConflict.
+	AddBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error
+
+	// DeleteBookmarkAlias removes a history URL association from a bookmark.
+	DeleteBookmarkAlias(ctx context.Context, bookmarkID int, alias string) error
+
+	// GetBookmarkAliases returns the history URLs of the requested bookmarks,
+	// keyed by bookmark ID.
+	GetBookmarkAliases(ctx context.Context, bookmarkIDs ...int) (map[int][]string, error)
 }
 
 // DBOrderMethod is the order method for getting bookmarks

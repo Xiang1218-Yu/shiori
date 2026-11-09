@@ -36,6 +36,15 @@ func testDatabase(t *testing.T, dbFactory testDatabaseFactory) {
 		"testSaveBookmark":                      testSaveBookmark,
 		"testBulkUpdateBookmarkTags":            testBulkUpdateBookmarkTags,
 		"testBookmarkExists":                    testBookmarkExists,
+		// Bookmark history URL aliases
+		"testHistoryURLsDisabledByDefault":        testHistoryURLsDisabledByDefault,
+		"testBookmarkAliasRecordsOldURLOnUpdate":  testBookmarkAliasRecordsOldURLOnUpdate,
+		"testBookmarkAliasIdempotent":             testBookmarkAliasIdempotent,
+		"testBookmarkAliasConflictRejected":       testBookmarkAliasConflictRejected,
+		"testBookmarkAliasChangeBackRemovesAlias": testBookmarkAliasChangeBackRemovesAlias,
+		"testBookmarkAliasDeleteCleansUp":         testBookmarkAliasDeleteCleansUp,
+		"testBookmarkAliasManualRemove":           testBookmarkAliasManualRemove,
+		"testBookmarkAliasMultipleHistoryURLs":    testBookmarkAliasMultipleHistoryURLs,
 		// Tags
 		"testCreateTag":             testCreateTag,
 		"testCreateTags":            testCreateTags,

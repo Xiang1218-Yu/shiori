@@ -42,8 +42,9 @@ func printHandler(cmd *cobra.Command, args []string) {
 	orderLatest, _ := cmd.Flags().GetBool("latest")
 	excludedTags, _ := cmd.Flags().GetStringSlice("exclude-tags")
 
-	// Convert args to ids
-	ids, err := parseStrIndices(args)
+	// Convert args to ids. With history URLs enabled, URL arguments are
+	// resolved to the stable bookmark identity behind the address.
+	ids, err := resolveBookmarkArgs(cmd.Context(), deps, args)
 	if err != nil {
 		cError.Printf("Failed to parse args: %v\n", err)
 		return

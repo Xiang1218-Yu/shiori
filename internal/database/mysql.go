@@ -68,6 +68,7 @@ var mysqlMigrations = []migration{
 	newFileMigration("0.8.2", "0.8.3", "mysql/0008_set_modified_at_equal_created_at"),
 	newFileMigration("0.8.3", "0.8.4", "mysql/0009_index_for_created_at"),
 	newFileMigration("0.8.4", "0.8.5", "mysql/0010_index_for_modified_at"),
+	newFileMigration("0.8.5", "0.8.6", "mysql/0011_bookmark_alias"),
 }
 
 // MySQLDatabase is implementation of Database interface
@@ -180,6 +181,11 @@ func (db *MySQLDatabase) SaveBookmarks(ctx context.Context, create bool, bookmar
 			return errors.WithStack(err)
 		}
 
+		stmtGetBookURL, err := tx.Preparex(`SELECT url FROM bookmark WHERE id = ?`)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+
 		// Prepare modified time
 		modifiedTime := time.Now().UTC().Format(model.DatabaseDateFormat)
 
@@ -204,6 +210,13 @@ func (db *MySQLDatabase) SaveBookmarks(ctx context.Context, create bool, bookmar
 			var err error
 			if create {
 				book.CreatedAt = modifiedTime
+				if db.historyURLsEnabled {
+					// Reject addresses that must keep resolving to an existing
+					// bookmark through its history URLs.
+					if err := db.rejectURLUsedAsAlias(ctx, tx, book.URL); err != nil {
+						return err
+					}
+				}
 				var res sql.Result
 				res, err = stmtInsertBook.ExecContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
@@ -214,9 +227,25 @@ func (db *MySQLDatabase) SaveBookmarks(ctx context.Context, create bool, bookmar
 					book.ID = int(bookID)
 				}
 			} else {
+				var oldURL string
+				if db.historyURLsEnabled {
+					// Fetch the current URL before updating so the previous
+					// address can be kept as history.
+					if err := stmtGetBookURL.GetContext(ctx, &oldURL, book.ID); err != nil {
+						return fmt.Errorf("failed to get current bookmark URL: %w", err)
+					}
+				}
 				_, err = stmtUpdateBook.ExecContext(ctx,
 					book.URL, book.Title, book.Excerpt, book.Author,
 					book.Public, book.Content, book.HTML, book.ModifiedAt, book.ID)
+
+				// Record history after the URL actually changed, still inside
+				// the transaction so a conflict rolls the whole update back.
+				if err == nil && db.historyURLsEnabled {
+					if err := db.recordBookmarkURLHistory(ctx, tx, book.ID, oldURL, book.URL); err != nil {
+						return err
+					}
+				}
 			}
 			if err != nil {
 				// Map unique constraint violations to database errors
@@ -324,10 +353,20 @@ func (db *MySQLDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBookm
 	if opts.Keyword != "" {
 		query += ` AND (
 			url LIKE ? OR
-			MATCH(title, excerpt, content) AGAINST (? IN BOOLEAN MODE)
-		)`
+			MATCH(title, excerpt, content) AGAINST (? IN BOOLEAN MODE)`
 
 		args = append(args, "%"+opts.Keyword+"%", opts.Keyword)
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE ?)`
+			args = append(args, "%"+opts.Keyword+"%")
+		}
+
+		query += `)`
 	}
 
 	// Add where clause for tags.
@@ -413,6 +452,11 @@ func (db *MySQLDatabase) GetBookmarks(ctx context.Context, opts model.DBGetBookm
 		bookmarks[i].Tags = tags
 	}
 
+	// Populate history URLs when the feature is enabled.
+	if err := db.enrichBookmarksWithAliases(ctx, bookmarks); err != nil {
+		return nil, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+
 	return bookmarks, nil
 }
 
@@ -454,12 +498,22 @@ func (db *MySQLDatabase) GetBookmarksCount(ctx context.Context, opts model.DBGet
 	if opts.Keyword != "" {
 		query += ` AND (
 			url LIKE ? OR
-			MATCH(title, excerpt, content) AGAINST (? IN BOOLEAN MODE)
-		)`
+			MATCH(title, excerpt, content) AGAINST (? IN BOOLEAN MODE)`
 
 		args = append(args,
 			"%"+opts.Keyword+"%",
 			opts.Keyword)
+
+		// Also match bookmarks through their history URLs when enabled.
+		if db.historyURLsEnabled {
+			query += ` OR id IN (
+				SELECT bookmark_id
+				FROM bookmark_alias
+				WHERE alias LIKE ?)`
+			args = append(args, "%"+opts.Keyword+"%")
+		}
+
+		query += `)`
 	}
 
 	// Add where clause for tags.
@@ -533,6 +587,11 @@ func (db *MySQLDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err e
 
 		// Delete bookmark(s)
 		if len(ids) == 0 {
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, nil); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
+			}
+
 			_, err := tx.ExecContext(ctx, delBookmarkTag)
 			if err != nil {
 				return errors.WithStack(err)
@@ -548,6 +607,11 @@ func (db *MySQLDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err e
 
 			stmtDelBookmark, _ := tx.Preparex(delBookmark)
 			stmtDelBookmarkTag, _ := tx.Preparex(delBookmarkTag)
+
+			// Explicitly remove aliases so no orphan history URLs remain.
+			if err := db.deleteBookmarkAliases(ctx, tx, ids); err != nil {
+				return fmt.Errorf("failed to delete bookmark aliases: %w", err)
+			}
 
 			for _, id := range ids {
 				_, err := stmtDelBookmarkTag.ExecContext(ctx, id)
@@ -573,6 +637,20 @@ func (db *MySQLDatabase) DeleteBookmarks(ctx context.Context, ids ...int) (err e
 // GetBookmark fetches bookmark based on its ID or URL.
 // Returns the bookmark and boolean whether it's exist or not.
 func (db *MySQLDatabase) GetBookmark(ctx context.Context, id int, url string) (model.BookmarkDTO, bool, error) {
+	// Resolve history URLs to the bookmark's stable identity when enabled.
+	// When disabled this keeps the historical behavior of matching the
+	// bookmark's current URL only.
+	if id == 0 && url != "" && db.historyURLsEnabled {
+		resolvedID, found, err := db.ResolveBookmarkIDByURL(ctx, url)
+		if err != nil {
+			return model.BookmarkDTO{}, false, fmt.Errorf("failed to resolve bookmark URL: %w", err)
+		}
+		if found {
+			id = resolvedID
+			url = ""
+		}
+	}
+
 	// Create the main query builder for bookmark data
 	sb := sqlbuilder.NewSelectBuilder()
 	sb.Select(
@@ -622,6 +700,13 @@ func (db *MySQLDatabase) GetBookmark(ctx context.Context, id int, url string) (m
 
 		book.Tags = tags
 	}
+
+	// Populate history URLs when the feature is enabled.
+	enriched := []model.BookmarkDTO{book}
+	if err := db.enrichBookmarksWithAliases(ctx, enriched); err != nil {
+		return book, false, fmt.Errorf("failed to get bookmark aliases: %w", err)
+	}
+	book = enriched[0]
 
 	return book, true, nil
 }
@@ -1004,10 +1089,26 @@ func (db *MySQLDatabase) SaveBookmark(ctx context.Context, bookmark model.Bookma
 	query = db.WriterDB().Rebind(query)
 
 	return db.withTx(ctx, func(tx *sqlx.Tx) error {
+		var oldURL string
+		if db.historyURLsEnabled {
+			err := tx.GetContext(ctx, &oldURL, `SELECT url FROM bookmark WHERE id = ?`, bookmark.ID)
+			if err != nil {
+				return fmt.Errorf("failed to get current bookmark URL: %w", err)
+			}
+		}
+
 		// Update bookmark
 		_, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to update bookmark: %w", err)
+		}
+
+		// Record history after the URL actually changed, still inside the
+		// transaction so a conflict rolls the whole update back.
+		if db.historyURLsEnabled {
+			if err := db.recordBookmarkURLHistory(ctx, tx, bookmark.ID, oldURL, bookmark.URL); err != nil {
+				return err
+			}
 		}
 
 		return nil

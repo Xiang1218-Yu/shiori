@@ -44,8 +44,9 @@ func openHandler(cmd *cobra.Command, args []string) {
 	archivePort, _ := cmd.Flags().GetInt("archive-port")
 	textCacheMode, _ := cmd.Flags().GetBool("text-cache")
 
-	// Convert args to ids
-	ids, err := parseStrIndices(args)
+	// Convert args to ids. With history URLs enabled, URL arguments are
+	// resolved to the stable bookmark identity behind the address.
+	ids, err := resolveBookmarkArgs(cmd.Context(), deps, args)
 	if err != nil {
 		cError.Println(err)
 		os.Exit(1)

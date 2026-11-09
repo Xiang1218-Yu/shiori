@@ -42,6 +42,7 @@ func ShioriCmd() *cobra.Command {
 		pocketCmd(),
 		serveCmd(),
 		checkCmd(),
+		aliasCmd(),
 		newVersionCommand(),
 		newServerCommand(),
 	)
@@ -93,6 +94,10 @@ func initShiori(ctx context.Context, cmd *cobra.Command) (*config.Config, *depen
 	if err != nil {
 		logger.WithError(err).Fatal("error opening database")
 	}
+
+	// Enable history URL aliases at the database layer. It defaults to false
+	// so the plain URL lookup behavior is preserved when the option is off.
+	db.SetHistoryURLsEnabled(cfg.Bookmark.HistoryURLsEnabled)
 
 	// Migrate
 	if err := db.Migrate(ctx); err != nil {

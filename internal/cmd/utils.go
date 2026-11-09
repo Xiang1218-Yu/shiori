@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	nurl "net/url"
@@ -13,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/fatih/color"
+	"github.com/go-shiori/shiori/internal/dependencies"
 	"github.com/go-shiori/shiori/internal/model"
 	"golang.org/x/term"
 )
@@ -28,7 +30,8 @@ var (
 	cInfo  = color.New(color.FgHiCyan)
 	cError = color.New(color.FgHiRed)
 
-	errInvalidIndex = errors.New("index is not valid")
+	errInvalidIndex        = errors.New("index is not valid")
+	errBookmarkURLNotFound = errors.New("no bookmark matches the given URL")
 )
 
 func normalizeSpace(str string) string {
@@ -54,6 +57,12 @@ func printBookmarks(bookmarks ...model.BookmarkDTO) {
 		// Print bookmark URL
 		cSymbol.Print(strSpace + "> ")
 		cURL.Println(bookmark.URL)
+
+		// Print history URLs
+		for _, historyURL := range bookmark.HistoryURLs {
+			cSymbol.Print(strSpace + "~ ")
+			cURL.Println(historyURL)
+		}
 
 		// Print bookmark excerpt
 		if bookmark.Excerpt != "" {
@@ -109,6 +118,41 @@ func parseStrIndices(indices []string) ([]int, error) {
 	}
 
 	return listIndex, nil
+}
+
+// resolveBookmarkArgs converts CLI arguments to bookmark IDs. Numeric
+// arguments and ranges keep behaving exactly like parseStrIndices. When
+// history URLs are enabled, absolute URLs are resolved to the stable
+// bookmark identity through current and history URLs.
+func resolveBookmarkArgs(ctx context.Context, deps *dependencies.Dependencies, args []string) ([]int, error) {
+	// Feature disabled: preserve the historical index-only behavior.
+	if !deps.Database().HistoryURLsEnabled() {
+		return parseStrIndices(args)
+	}
+
+	ids := make([]int, 0, len(args))
+	for _, arg := range args {
+		if isURLValid(arg) {
+			book, exists, err := deps.Database().GetBookmark(ctx, 0, arg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve URL %q: %w", arg, err)
+			}
+			if !exists {
+				return nil, fmt.Errorf("%w: %s", errBookmarkURLNotFound, arg)
+			}
+			ids = append(ids, book.ID)
+			continue
+		}
+
+		// Keep supporting plain indices and ranges (e.g. "5", "1-3").
+		parsed, err := parseStrIndices([]string{arg})
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, parsed...)
+	}
+
+	return ids, nil
 }
 
 // openBrowser tries to open the URL in a browser,

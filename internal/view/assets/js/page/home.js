@@ -62,9 +62,11 @@ var template = `
             :HideExcerpt="appOptions.HideExcerpt"
             :selected="isSelected(book.ID)"
             :menuVisible="activeAccount.Owner"
+            :historyVisible="historyURLsEnabled"
             @select="toggleSelection"
             @tag-clicked="bookmarkTagClicked"
             @edit="showDialogEdit"
+            @history="showDialogHistory"
             @delete="showDialogDelete"
             @generate-ebook="ebookGenerate"
             @update="showDialogUpdateCache">
@@ -85,6 +87,39 @@ var template = `
         </a>
     </custom-dialog>
     <custom-dialog v-bind="dialog"/>
+    <custom-dialog v-bind="dialogHistory">
+        <div class="history-urls-dialog">
+            <p class="custom-dialog-content">
+                Previous URLs that still resolve to this bookmark.
+            </p>
+            <p v-if="historyAliasURLs.length === 0" class="history-urls-empty">
+                No history URLs saved for this bookmark.
+            </p>
+            <ul v-else class="history-urls-list">
+                <li v-for="aliasURL in historyAliasURLs" :key="aliasURL">
+                    <a :href="aliasURL" target="_blank" rel="noopener noreferrer" :title="aliasURL">
+                        ~ {{aliasURL}}
+                    </a>
+                    <a title="Remove history URL" @click="removeHistoryURL(aliasURL)">
+                        <i class="fas fa-fw fa-trash-alt"></i>
+                    </a>
+                </li>
+            </ul>
+            <div class="history-urls-add">
+                <input type="text"
+                    v-model="historyAliasInput"
+                    placeholder="https://old.example.com/page"
+                    :disabled="dialogHistory.loading"
+                    @keyup.enter="addHistoryURL">
+                <a class="history-urls-add-button"
+                    :class="{disabled: dialogHistory.loading || !historyAliasInput.trim()}"
+                    @click="addHistoryURL">
+                    Add
+                </a>
+            </div>
+            <p v-if="historyAliasError" class="history-urls-error">{{historyAliasError}}</p>
+        </div>
+    </custom-dialog>
 </div>`;
 
 import paginationBox from "../component/pagination.js";
@@ -120,6 +155,26 @@ export default {
 			maxPage: 0,
 			bookmarks: [],
 			tags: [],
+
+			// Bookmark history URLs (aliases), hidden unless the server
+			// reports the feature as enabled.
+			historyURLsEnabled: false,
+			historyAliasURLs: [],
+			historyAliasInput: "",
+			historyAliasError: "",
+			historyAliasBookmark: null,
+			dialogHistory: {
+				visible: false,
+				loading: false,
+				title: "History URLs",
+				mainText: "Close",
+				mainClick: () => {
+					this.dialogHistory.visible = false;
+				},
+				escPressed: () => {
+					if (!this.dialogHistory.loading) this.dialogHistory.visible = false;
+				},
+			},
 
 			dialogTags: {
 				visible: false,
@@ -641,6 +696,104 @@ export default {
 				},
 			});
 		},
+		async fetchHistoryCapabilities() {
+			try {
+				const caps = await apiRequest(
+					new URL("api/v1/bookmarks/capabilities", document.baseURI),
+				);
+				this.historyURLsEnabled = Boolean(caps && caps.historyUrlsEnabled);
+			} catch (err) {
+				// Keep the feature completely hidden when the server cannot
+				// report its capabilities.
+				this.historyURLsEnabled = false;
+			}
+		},
+		showDialogHistory(item) {
+			// Check the item
+			if (typeof item !== "object") return;
+
+			var id = typeof item.id === "number" ? item.id : 0,
+				index = typeof item.index === "number" ? item.index : -1;
+
+			if (id < 1 || index < 0) return;
+
+			var book = this.bookmarks[index];
+			this.historyAliasBookmark = { id: id, index: index };
+			this.historyAliasURLs = Array.isArray(book.HistoryURLs)
+				? book.HistoryURLs.slice()
+				: [];
+			this.historyAliasInput = "";
+			this.historyAliasError = "";
+			this.dialogHistory.loading = false;
+			this.dialogHistory.visible = true;
+		},
+		async refreshHistoryAliasBookmark() {
+			// Refetch the bookmark so the dialog reflects the canonical URLs
+			// stored by the server (normalization, idempotent inserts).
+			const updated = await bookmarksApi.apiV1BookmarksIdGet({
+				id: this.historyAliasBookmark.id,
+			});
+			this.historyAliasURLs = Array.isArray(updated.HistoryURLs)
+				? updated.HistoryURLs.slice()
+				: [];
+			this.bookmarks.splice(this.historyAliasBookmark.index, 1, updated);
+		},
+		async addHistoryURL() {
+			var aliasURL = this.historyAliasInput.trim();
+			if (
+				aliasURL === "" ||
+				this.dialogHistory.loading ||
+				this.historyAliasBookmark === null
+			) {
+				return;
+			}
+
+			this.dialogHistory.loading = true;
+			this.historyAliasError = "";
+			try {
+				await apiRequest(
+					new URL(
+						`api/v1/bookmarks/${this.historyAliasBookmark.id}/aliases`,
+						document.baseURI,
+					),
+					{
+						method: "POST",
+						body: JSON.stringify({ url: aliasURL }),
+					},
+				);
+				this.historyAliasInput = "";
+				await this.refreshHistoryAliasBookmark();
+			} catch (err) {
+				this.historyAliasError = err.message || "Failed to add history URL";
+			} finally {
+				this.dialogHistory.loading = false;
+			}
+		},
+		async removeHistoryURL(aliasURL) {
+			if (this.dialogHistory.loading || this.historyAliasBookmark === null) {
+				return;
+			}
+
+			this.dialogHistory.loading = true;
+			this.historyAliasError = "";
+			try {
+				await apiRequest(
+					new URL(
+						`api/v1/bookmarks/${this.historyAliasBookmark.id}/aliases`,
+						document.baseURI,
+					),
+					{
+						method: "DELETE",
+						body: JSON.stringify({ url: aliasURL }),
+					},
+				);
+				await this.refreshHistoryAliasBookmark();
+			} catch (err) {
+				this.historyAliasError = err.message || "Failed to remove history URL";
+			} finally {
+				this.dialogHistory.loading = false;
+			}
+		},
 		showDialogDelete(items) {
 			// Check and filter items
 			if (typeof items !== "object") return;
@@ -1099,5 +1252,6 @@ export default {
 		}
 
 		this.loadData(false, true);
+		this.fetchHistoryCapabilities();
 	},
 };
